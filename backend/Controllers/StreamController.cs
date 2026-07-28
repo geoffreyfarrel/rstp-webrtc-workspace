@@ -131,8 +131,30 @@ namespace backend.Controllers
                             try
                             {
                                 _logger.LogInformation("[FFmpeg] Starting video source...");
-                                await ffmpegSource.Start();
-                                _logger.LogInformation("[FFmpeg] Start() returned normally.");
+
+                                // Kick of Start() but don't await it directly - grab the running Task
+                                var startTask = ffmpegSource.Start();
+                                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+
+                                // Race the two: whichever finishes first "wins"
+                                var completedTask = await Task.WhenAny(startTask, timeoutTask);
+
+                                if (completedTask == timeoutTask)
+                                {
+                                    _logger.LogError("[ffmpeg] RTSP connection timed out after 5s. Closing connection.");
+                                    ffmpegSource.CloseVideo();
+                                    pc.Close("RTSP source unreachable (timeout)");
+                                }
+
+                                else
+                                {
+                                    // startTask finished first — but check if it actually succeeded or threw
+                                    await startTask;
+                                    _logger.LogInformation("[ffmpeg] Start() completed successfully.");
+                                }
+
+
+                                    _logger.LogInformation("[FFmpeg] Start() returned normally.");
                             }
                             catch (Exception ex)
                             {
