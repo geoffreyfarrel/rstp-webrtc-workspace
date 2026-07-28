@@ -64,4 +64,4 @@ Before you begin, ensure you have the following installed:
 
 ---
 
-_Developed by Geo._
+_Developed by Geoffrey Farrel._
