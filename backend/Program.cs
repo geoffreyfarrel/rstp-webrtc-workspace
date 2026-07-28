@@ -1,3 +1,5 @@
+using backend.Controllers;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
@@ -14,6 +16,9 @@ builder.Services.AddCors(options =>
 builder.Services.AddControllers();
 
 var app = builder.Build();
+
+string relativePath = builder.Configuration["StreamSettings:FFmpegPath"] ?? "public/bin";
+StreamController.Initialise(builder.Environment.ContentRootPath, relativePath);
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())

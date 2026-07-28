@@ -16,11 +16,11 @@ namespace backend.Controllers
             _logger = logger;
         }
 
-        static StreamController()
-        {
-            string binaryPath = "D:\\Repos\\rtsp-webrtc-workspace\\backend\\public\\bin";
-            FFmpegInit.Initialise(libPath: binaryPath);
-        }
+            public static void Initialise(string contentRootPath, string relativeLibPath)
+            {
+                string binaryPath = Path.Combine(contentRootPath, relativeLibPath);
+                FFmpegInit.Initialise(libPath: binaryPath);
+            }
 
         [HttpGet("test")]
         public IActionResult GetTest()
