@@ -10,17 +10,19 @@ namespace backend.Controllers
     public class StreamController : ControllerBase
     {
         private readonly ILogger<StreamController> _logger;
+        private readonly IConfiguration _configuration;
 
-        public StreamController(ILogger<StreamController> logger)
+        public StreamController(ILogger<StreamController> logger, IConfiguration configuration)
         {
             _logger = logger;
+            _configuration = configuration;
         }
 
-            public static void Initialise(string contentRootPath, string relativeLibPath)
-            {
-                string binaryPath = Path.Combine(contentRootPath, relativeLibPath);
-                FFmpegInit.Initialise(libPath: binaryPath);
-            }
+        public static void Initialise(string contentRootPath, string relativeLibPath)
+        {
+            string binaryPath = Path.Combine(contentRootPath, relativeLibPath);
+            FFmpegInit.Initialise(libPath: binaryPath);
+        }
 
         [HttpGet("test")]
         public IActionResult GetTest()
@@ -39,15 +41,32 @@ namespace backend.Controllers
                 return BadRequest("No SDP offer provided.");
             }
 
-            // 2. Initialize a new WebRTC Peer Connection
-            var pc = new RTCPeerConnection(null);
+            // 2. Initialize a new WebRTC Peer Connection (with a STUN server configured)
+            var config = new RTCConfiguration
+            {
+                iceServers = new List<RTCIceServer>
+                {
+                    new RTCIceServer { urls = "stun:stun.l.google.com:19302" }
+                }
+            };
+            var pc = new RTCPeerConnection(config);
 
             // 3. Set up the RTSP Video Source using FFmpeg
-            string rtspURL = "rtsp://127.0.0.1:8554/mystream";
+            string? rtspURL = _configuration["StreamSettings:RtspUrl"];
+            if (string.IsNullOrWhiteSpace(rtspURL))
+            {
+                _logger.LogError("[Config] 'Camera:RtspUrl' is not set in appsettings.json");
+                return BadRequest("Camera RTSP URL is not configured.");
+            }
+            _logger.LogInformation("[Config] Using RTSP URL from appsettings: {Url}",
+                rtspURL.Contains('@') ? rtspURL[(rtspURL.IndexOf('@'))..] : rtspURL); // avoid logging credentials
             var ffmpegSource = new FFmpegFileSource(rtspURL, false, null);
 
             // Restrict to a specific format the encoder can actually produce
             ffmpegSource.RestrictFormats(format => format.Codec == VideoCodecsEnum.H264);
+            
+            var ffmpegInitLock = new SemaphoreSlim(1, 1);
+            var videoFormatSet = false;
 
             try
             {
@@ -74,11 +93,34 @@ namespace backend.Controllers
                 // CRITICAL: tells the source which format was actually negotiated with the
                 // browser once SDP negotiation completes. Without this, the source never
                 // knows what to encode into and silently produces no samples.
+                //
+                // This now runs under ffmpegInitLock so it can never overlap with Start().
                 pc.OnVideoFormatsNegotiated += (negotiatedFormats) =>
                 {
                     var chosenFormat = negotiatedFormats.First();
                     _logger.LogInformation("[FFmpeg] Video format negotiated: {Format}", chosenFormat.Codec);
-                    ffmpegSource.SetVideoSourceFormat(chosenFormat);
+
+                    _ = Task.Run(async () =>
+                    {
+                        await ffmpegInitLock.WaitAsync();
+                        try
+                        {
+                            // Real cameras (RTSP/TCP handshake) can take a while here.
+                            // No artificial timeout — let it run, but the lock guarantees
+                            // Start() will simply wait rather than colliding with it.
+                            ffmpegSource.SetVideoSourceFormat(chosenFormat);
+                            videoFormatSet = true;
+                            _logger.LogInformation("[FFmpeg] SetVideoSourceFormat completed OK");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "[FFmpeg] SetVideoSourceFormat threw");
+                        }
+                        finally
+                        {
+                            ffmpegInitLock.Release();
+                        }
+                    });
                 };
 
                 // 4. Handle the WebRTC Handshake (Signaling)
@@ -128,24 +170,28 @@ namespace backend.Controllers
                     {
                         _ = Task.Run(async () =>
                         {
+                            await ffmpegInitLock.WaitAsync();
                             try
                             {
+                                if (!videoFormatSet)
+                                {
+                                    _logger.LogWarning("[FFmpeg] Connection state is 'connected' but video format " +
+                                        "hasn't finished being set yet — waited for lock, proceeding now.");
+                                }
+
                                 _logger.LogInformation("[FFmpeg] Starting video source...");
 
-                                // Kick of Start() but don't await it directly - grab the running Task
                                 var startTask = ffmpegSource.Start();
                                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
 
-                                // Race the two: whichever finishes first "wins"
-                                var completedTask = await Task.WhenAny(startTask, timeoutTask);
+                                var raceResult = await Task.WhenAny(startTask, timeoutTask);
 
-                                if (completedTask == timeoutTask)
+                                if (raceResult == timeoutTask)
                                 {
                                     _logger.LogError("[ffmpeg] RTSP connection timed out after 5s. Closing connection.");
-                                    ffmpegSource.CloseVideo();
+                                    await ffmpegSource.CloseVideo();
                                     pc.Close("RTSP source unreachable (timeout)");
                                 }
-
                                 else
                                 {
                                     // startTask finished first — but check if it actually succeeded or threw
@@ -153,12 +199,15 @@ namespace backend.Controllers
                                     _logger.LogInformation("[ffmpeg] Start() completed successfully.");
                                 }
 
-
-                                    _logger.LogInformation("[FFmpeg] Start() returned normally.");
+                                _logger.LogInformation("[FFmpeg] Start() returned normally.");
                             }
                             catch (Exception ex)
                             {
                                 _logger.LogError(ex, "[FFmpeg] Start() threw an exception.");
+                            }
+                            finally
+                            {
+                                ffmpegInitLock.Release();
                             }
                         });
                     }
