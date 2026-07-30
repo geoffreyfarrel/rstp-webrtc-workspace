@@ -59,18 +59,22 @@ namespace backend.Controllers
                 return BadRequest("Camera RTSP URL is not configured.");
             }
             _logger.LogInformation("[Config] Using RTSP URL from appsettings: {Url}",
+
                 rtspURL.Contains('@') ? rtspURL[(rtspURL.IndexOf('@'))..] : rtspURL); // avoid logging credentials
+
             var ffmpegSource = new FFmpegFileSource(rtspURL, false, null);
 
             // Restrict to a specific format the encoder can actually produce
             ffmpegSource.RestrictFormats(format => format.Codec == VideoCodecsEnum.H264);
             
+            // not necessary
             var ffmpegInitLock = new SemaphoreSlim(1, 1);
             var videoFormatSet = false;
 
             try
             {
                 var videoFormats = ffmpegSource.GetVideoSourceFormats();
+
                 _logger.LogInformation("[FFmpeg] Video formats found: {Count} — {Formats}",
                     videoFormats.Count,
                     string.Join(", ", videoFormats.Select(f => f.Codec.ToString())));
@@ -220,13 +224,16 @@ namespace backend.Controllers
 
                 // WHEP requires a 201 Created response with SDP answer in the body
                 Response.StatusCode = StatusCodes.Status201Created;
+
                 return Content(pc.localDescription.sdp.ToString(), "application/sdp");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[PC] Exception during WHEP negotiation.");
+
                 await ffmpegSource.CloseVideo();
                 pc.Close("Negotiation failed");
+
                 return StatusCode(StatusCodes.Status500InternalServerError, "Failed to negotiate WebRTC connection.");
             }
         }
