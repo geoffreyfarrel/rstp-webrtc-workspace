@@ -99,28 +99,6 @@ async function connectCamera(camera: Camera) {
   }
 }
 
-// Two cameras negotiating ICE at the same time on the backend reliably
-// fails - SIPSorcery's RtpIceChannel connectivity checks for both cameras
-// contend with each other and every checklist entry (host, srflx, and even
-// relay-to-relay pairs) ends up timing out, even though either camera
-// connects fine alone. Waiting for one camera to fully settle (connected or
-// failed) before starting the next one's negotiation avoids that
-// contention entirely.
-function waitForOutcome(cameraId: string, timeoutMs = 15000): Promise<void> {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const check = () => {
-      const status = connectionStore.getConnection(cameraId);
-      if (status !== ConnectionStatusEnum.CONNECTING || Date.now() - start > timeoutMs) {
-        resolve();
-        return;
-      }
-      setTimeout(check, 250);
-    };
-    check();
-  });
-}
-
 onMounted(async () => {
   try {
     const response = await fetch(new URL('/Stream/cameras', BACKEND_URL));
@@ -133,9 +111,11 @@ onMounted(async () => {
   // Wait for the v-for above to render a <video> per camera before wiring
   // players up to them.
   await nextTick();
+
+  // Fire all camera connections concurrently instead of waiting for each
+  // one to settle before starting the next.
   for (const camera of cameras.value) {
-    await connectCamera(camera);
-    await waitForOutcome(camera.id);
+    connectCamera(camera);
   }
 
   // Expose for console debugging
