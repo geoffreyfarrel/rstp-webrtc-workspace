@@ -101,12 +101,14 @@ namespace backend.Controllers
                 pc.addTrack(videoTrack);
 
                 // Bandwidth for the TURN-relay test is minimized via the encoder bitrate cap
-                // alone (see SetVideoEncoderBitrate below). An earlier attempt to also drop
-                // most encoded samples here broke H264's inter-frame prediction chain - only
-                // the very first sample is a true self-contained IDR, so skipping frames after
-                // it (P-frames, or "keyframes" libx264 silently downgrades to non-IDR I-frames)
-                // left the decoder permanently out of sync and nothing ever rendered. Every
-                // encoded sample must be forwarded.
+                // alone (see the PRODUCTION TUNING block below). An earlier attempt to also
+                // drop most encoded samples here broke H264's inter-frame prediction chain -
+                // only the very first sample is a true self-contained IDR, so skipping frames
+                // after it (P-frames, or "keyframes" libx264 silently downgrades to non-IDR
+                // I-frames) left the decoder permanently out of sync and nothing ever
+                // rendered. Every encoded sample must be forwarded - if framerate ever needs
+                // throttling, do it on the *raw* frames in OnVideoSourceRawSample below
+                // instead, not here.
 
                 // Wire up the encoded video samples from FFmpeg to the WebRTC connection
                 ffmpegSource.OnVideoSourceEncodedSample += (durationRtpUnits, sample) =>
@@ -142,11 +144,26 @@ namespace backend.Controllers
                             videoFormatSet = true;
                             _logger.LogInformation("[FFmpeg] SetVideoSourceFormat completed OK");
 
+                            // ================================================================
+                            // PRODUCTION TUNING: bitrate & framerate - adjust here.
+                            //
+                            // Bitrate: set via StreamSettings:TargetBitrate in
+                            // appsettings.json (100kbps below is a fallback default). It was
+                            // picked deliberately low to keep the TURN relay test lightweight,
+                            // not for real-world video quality - raise it for production.
+                            //
+                            // Framerate: not throttled anywhere currently - every raw frame
+                            // from the camera gets encoded and forwarded as-is. If it ever
+                            // needs limiting, do it in OnVideoSourceRawSample above (skip raw
+                            // frames before they're encoded), never on already-encoded samples
+                            // in OnVideoSourceEncodedSample - that breaks H264's inter-frame
+                            // prediction chain (see the comment above that handler).
+                            // ================================================================
+                            //
                             // SIPSorceryMedia.FFmpeg doesn't expose bitrate control on
                             // FFmpegFileSource itself, only on the internal FFmpegVideoSource
-                            // it wraps (private field). Reached via reflection to cap the H264
-                            // encoder's target bitrate for the TURN bandwidth test. NOTE: relies
-                            // on the "_FFmpegVideoSource" private field name in the
+                            // it wraps (private field). Reached via reflection below. NOTE:
+                            // relies on the "_FFmpegVideoSource" private field name in the
                             // SIPSorceryMedia.FFmpeg NuGet package (v10.0.12) — re-check this if
                             // that package is upgraded.
                             var targetBitrate = _configuration.GetValue<long?>("StreamSettings:TargetBitrate") ?? 100_000;
