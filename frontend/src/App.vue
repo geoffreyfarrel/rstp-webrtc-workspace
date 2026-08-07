@@ -4,20 +4,6 @@
 
     <div class="video-wrapper">
       <video ref="videoElement" autoplay playsinline muted controls></video>
-      <!-- <div
-        v-if="connectionStore.connectionStatus !== ConnectionStatusEnum.CONNECTED"
-        class="overlay"
-      >
-        <div
-          v-if="connectionStore.connectionStatus === ConnectionStatusEnum.CONNECTING"
-          class="spinner"
-        >
-          <LoaderCircle class="spinner-logo" />
-        </div>
-      </div>
-      <h2 v-else-if="connectionStore.connectionStatus !== ConnectionStatusEnum.CONNECTED"
-        >Connection Failed</h2
-      > -->
     </div>
   </main>
 </template>
@@ -26,30 +12,12 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { useConnectionStore } from './stores/connectionStore';
 import { ConnectionStatusEnum } from './typings';
-import { LoaderCircle } from 'lucide-vue-next';
 import { WebRTCPlayer } from '@eyevinn/webrtc-player';
-// @ts-ignore - plain JS file, no types
-// import WebRtcStreamer from './lib/webrtcstreamer.js';
 
 const videoElement = ref<HTMLVideoElement | null>(null);
 let player: WebRTCPlayer | null = null;
 
 const connectionStore = useConnectionStore();
-
-// --- webrtc-streamer connection (commented out - replaced by the C# WHEP
-// backend + @eyevinn/webrtc-player below) ---
-//
-// webrtc-streamer's native server (not the /api/whep shim, which never
-// delivers its own ICE candidates back to WHEP clients - confirmed via
-// testing that localhost:8000, using this native protocol, plays video
-// fine while /api/whep never progresses past iceConnectionState "new").
-//
-// This talks directly to the webrtc-streamer container's own REST API:
-// /api/getIceServers, /api/call, /api/addIceCandidate, /api/getIceCandidate,
-// /api/hangup - all proxied same-origin via vite.config.ts so it also works
-// through the ngrok tunnel for remote access.
-// const STREAMER_URL = import.meta.env.VITE_WEBRTC_STREAMER_URL ?? '';
-// const STREAM_NAME = import.meta.env.VITE_STREAM_NAME ?? 'camera1';
 
 // C# WHEP backend (backend/Controllers/StreamController.cs). Defaults to
 // same-origin so it goes through vite.config.ts's /Stream proxy - required
@@ -67,34 +35,11 @@ onMounted(async () => {
 
   videoElement.value.addEventListener('playing', handlePlaying);
 
-  // webRtcServer = new WebRtcStreamer(videoElement.value, STREAMER_URL || window.location.origin);
-  //
-  // webRtcServer.iceServers = {
-  //   iceServers: [
-  //     {
-  //       urls: 'turn:<turn-host>:3478',
-  //       username: '<turn-username>',
-  //       credential: '<turn-credential>',
-  //     },
-  //   ],
-  // };
-  //
-  // (window as any).webRtcServer = webRtcServer;
-  //
-  // try {
-  //   // connect(videourl, audiourl, options, localstream, prefmime)
-  //   webRtcServer.connect(STREAM_NAME, undefined, 'rtptransport=tcp');
-  // } catch (error) {
-  //   connectionStore.setConnection(ConnectionStatusEnum.FAILED);
-  //   console.error('Failed to connect stream:', error);
-  // }
-
   player = new WebRTCPlayer({
     video: videoElement.value,
     type: 'whep',
     statsTypeFilter: '^candidate-*|^inbound-rtp',
     iceServers: [
-      // { urls: 'stun:stun.l.google.com:19302' },
       {
         urls: `turn:${import.meta.env.VITE_TURN_HOST}`,
         username: import.meta.env.VITE_TURN_USERNAME,
