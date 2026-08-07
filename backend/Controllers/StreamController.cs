@@ -1,4 +1,6 @@
-﻿using System.Reflection;
+using System.Reflection;
+using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Mvc;
 using SIPSorcery.Net;
 using SIPSorceryMedia.Abstractions;
@@ -31,9 +33,51 @@ namespace backend.Controllers
             return Ok("Backend is reachable!");
         }
 
-        [HttpPost("whep")]
-        public async Task<IActionResult> PostWhepOffer()
+        private List<CameraConfig> ResolveCameras() =>
+            _configuration.GetSection("StreamSettings:Cameras").Get<List<CameraConfig>>() ?? [];
+
+        // Never returns RtspUrl - camera credentials stay server-side, the
+        // browser only ever needs an id to request a stream by.
+        [HttpGet("cameras")]
+        public IActionResult GetCameras()
         {
+            var cameras = ResolveCameras().Select(c => new { c.Id, c.Name });
+            return Ok(cameras);
+        }
+
+        // Time-limited TURN credentials (coturn's use-auth-secret scheme) for
+        // the browser's own ICE side of the connection - the backend mints
+        // these instead of handing out a static username/password so the
+        // shared secret in appsettings.json never reaches client code.
+        [HttpGet("turn-credentials/{cameraId}")]
+        public IActionResult GetTurnCredentials(string cameraId)
+        {
+            var secret = _configuration["Turn:Secret"];
+            if (string.IsNullOrEmpty(secret))
+            {
+                _logger.LogError("[Config] 'Turn:Secret' is not set in appsettings.json");
+                return StatusCode(StatusCodes.Status500InternalServerError, "TURN secret is not configured.");
+            }
+
+            var (username, credential) = TurnCredentialGenerator.Generate(secret, cameraId, TimeSpan.FromHours(1));
+            return Ok(new { host = _configuration["Turn:Host"], username, credential });
+        }
+
+        [HttpPost("whep/{cameraId}")]
+        public async Task<IActionResult> PostWhepOffer(string cameraId)
+        {
+            var camera = ResolveCameras().FirstOrDefault(c => string.Equals(c.Id, cameraId, StringComparison.OrdinalIgnoreCase));
+            if (camera == null)
+            {
+                _logger.LogError("[Config] No camera configured with id '{CameraId}'", cameraId);
+                return NotFound($"No camera configured with id '{cameraId}'.");
+            }
+
+            void LogInfo(string message, params object?[] args) => _logger.LogInformation($"[{cameraId}] {message}", args);
+            void LogWarn(string message, params object?[] args) => _logger.LogWarning($"[{cameraId}] {message}", args);
+            void LogErr(string message, params object?[] args) => _logger.LogError($"[{cameraId}] {message}", args);
+            void LogErrEx(Exception ex, string message, params object?[] args) => _logger.LogError(ex, $"[{cameraId}] {message}", args);
+
             // 1. Read the SDP offer from the frontend's POST request body
             using var reader = new StreamReader(Request.Body);
             var offerSdp = await reader.ReadToEndAsync();
@@ -50,19 +94,35 @@ namespace backend.Controllers
             // of m-lines in answer doesn't match order in offer." An
             // unwanted m-line must be answered as inactive/rejected, not
             // omitted.
-            _logger.LogInformation("[PC] Offer SDP (raw):\n{Sdp}", offerSdp);
+            LogInfo("[PC] Offer SDP (raw):\n{Sdp}", offerSdp);
 
             // 2. Initialize a new WebRTC Peer Connection (STUN fallback + our TURN relay)
+            var turnSecret = _configuration["Turn:Secret"];
+            if (string.IsNullOrEmpty(turnSecret))
+            {
+                LogErr("[Config] 'Turn:Secret' is not set in appsettings.json");
+                return StatusCode(StatusCodes.Status500InternalServerError, "TURN secret is not configured.");
+            }
+            // Own time-limited credential, distinct per camera/negotiation - each
+            // RTCPeerConnection (this one and the browser's, via GET
+            // turn-credentials/{cameraId}) gets its own identity instead of every
+            // camera/client sharing one static TURN user.
+            var (backendTurnUsername, backendTurnCredential) =
+                TurnCredentialGenerator.Generate(turnSecret, $"backend-{cameraId}", TimeSpan.FromHours(1));
+
             var config = new RTCConfiguration
             {
                 iceServers = new List<RTCIceServer>
                 {
-                    // new RTCIceServer { urls = "stun:stun.l.google.com:19302" },
+                    // Same coturn box also answers plain STUN binding requests - lets ICE
+                    // learn the server-reflexive candidate via a lightweight STUN Binding
+                    // request instead of always needing a full TURN Allocate.
+                    new RTCIceServer { urls = $"stun:{_configuration["Turn:Host"]}" },
                     new RTCIceServer
                     {
                         urls = $"turn:{_configuration["Turn:Host"]}",
-                        username = _configuration["Turn:Username"],
-                        credential = _configuration["Turn:Credential"],
+                        username = backendTurnUsername,
+                        credential = backendTurnCredential,
                     },
                 },
                 X_BindAddress = System.Net.IPAddress.Any,
@@ -70,21 +130,15 @@ namespace backend.Controllers
             var pc = new RTCPeerConnection(config);
 
             // 3. Set up the RTSP Video Source using FFmpeg
-            string? rtspURL = _configuration["StreamSettings:RtspUrl"];
-            if (string.IsNullOrWhiteSpace(rtspURL))
-            {
-                _logger.LogError("[Config] 'Camera:RtspUrl' is not set in appsettings.json");
-                return BadRequest("Camera RTSP URL is not configured.");
-            }
-            _logger.LogInformation("[Config] Using RTSP URL from appsettings: {Url}",
-
+            var rtspURL = camera.RtspUrl;
+            LogInfo("[Config] Using RTSP URL for '{CameraName}': {Url}", camera.Name,
                 rtspURL.Contains('@') ? rtspURL[(rtspURL.IndexOf('@'))..] : rtspURL); // avoid logging credentials
 
             var ffmpegSource = new FFmpegFileSource(rtspURL, false, null);
 
             // Restrict to a specific format the encoder can actually produce
             ffmpegSource.RestrictFormats(format => format.Codec == VideoCodecsEnum.H264);
-            
+
             // not necessary
             var ffmpegInitLock = new SemaphoreSlim(1, 1);
             var videoFormatSet = false;
@@ -93,7 +147,7 @@ namespace backend.Controllers
             {
                 var videoFormats = ffmpegSource.GetVideoSourceFormats();
 
-                _logger.LogInformation("[FFmpeg] Video formats found: {Count} — {Formats}",
+                LogInfo("[FFmpeg] Video formats found: {Count} — {Formats}",
                     videoFormats.Count,
                     string.Join(", ", videoFormats.Select(f => f.Codec.ToString())));
 
@@ -111,15 +165,22 @@ namespace backend.Controllers
                 // instead, not here.
 
                 // Wire up the encoded video samples from FFmpeg to the WebRTC connection
+                //
+                // NOTE: these fire ~20-30x/sec per camera - LogInformation here (piped
+                // synchronously to console + backend.log) floods the logger badly enough
+                // that a second camera negotiating ICE while this one is already streaming
+                // sees its STUN retransmission timers starved and every checklist entry
+                // times out. LogDebug so they're filtered out at the default Information
+                // level but can still be re-enabled for debugging.
                 ffmpegSource.OnVideoSourceEncodedSample += (durationRtpUnits, sample) =>
                 {
-                    _logger.LogInformation("[FFmpeg] Sending sample, {Bytes} bytes", sample.Length);
+                    _logger.LogDebug("[{CameraId}] [FFmpeg] Sending sample, {Bytes} bytes", cameraId, sample.Length);
                     pc.SendVideo(durationRtpUnits, sample);
                 };
 
                 ffmpegSource.OnVideoSourceRawSample += (durationMs, width, height, sample, pixelFormat) =>
                 {
-                    _logger.LogInformation("[FFmpeg] Raw sample: {Width}x{Height}, {Bytes} bytes", width, height, sample.Length);
+                    _logger.LogDebug("[{CameraId}] [FFmpeg] Raw sample: {Width}x{Height}, {Bytes} bytes", cameraId, width, height, sample.Length);
                 };
 
                 // CRITICAL: tells the source which format was actually negotiated with the
@@ -130,7 +191,7 @@ namespace backend.Controllers
                 pc.OnVideoFormatsNegotiated += (negotiatedFormats) =>
                 {
                     var chosenFormat = negotiatedFormats.First();
-                    _logger.LogInformation("[FFmpeg] Video format negotiated: {Format}", chosenFormat.Codec);
+                    LogInfo("[FFmpeg] Video format negotiated: {Format}", chosenFormat.Codec);
 
                     _ = Task.Run(async () =>
                     {
@@ -142,7 +203,7 @@ namespace backend.Controllers
                             // Start() will simply wait rather than colliding with it.
                             ffmpegSource.SetVideoSourceFormat(chosenFormat);
                             videoFormatSet = true;
-                            _logger.LogInformation("[FFmpeg] SetVideoSourceFormat completed OK");
+                            LogInfo("[FFmpeg] SetVideoSourceFormat completed OK");
 
                             // ================================================================
                             // PRODUCTION TUNING: bitrate & framerate - adjust here.
@@ -172,16 +233,16 @@ namespace backend.Controllers
                             if (videoSourceField?.GetValue(ffmpegSource) is FFmpegVideoSource innerVideoSource)
                             {
                                 innerVideoSource.SetVideoEncoderBitrate(targetBitrate, null, null, targetBitrate);
-                                _logger.LogInformation("[FFmpeg] Capped encoder bitrate to {Bitrate} bps", targetBitrate);
+                                LogInfo("[FFmpeg] Capped encoder bitrate to {Bitrate} bps", targetBitrate);
                             }
                             else
                             {
-                                _logger.LogWarning("[FFmpeg] Could not reach internal FFmpegVideoSource via reflection; bitrate not capped.");
+                                LogWarn("[FFmpeg] Could not reach internal FFmpegVideoSource via reflection; bitrate not capped.");
                             }
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "[FFmpeg] SetVideoSourceFormat threw");
+                            LogErrEx(ex, "[FFmpeg] SetVideoSourceFormat threw");
                         }
                         finally
                         {
@@ -195,7 +256,7 @@ namespace backend.Controllers
                 var setResult = pc.setRemoteDescription(offerInit);
                 if (setResult != SetDescriptionResultEnum.OK)
                 {
-                    _logger.LogError("[PC] setRemoteDescription failed: {Result}", setResult);
+                    LogErr("[PC] setRemoteDescription failed: {Result}", setResult);
                     return BadRequest($"Failed to set remote description: {setResult}");
                 }
 
@@ -206,7 +267,7 @@ namespace backend.Controllers
                 var iceGatheringComplete = new TaskCompletionSource<bool>();
                 pc.onicegatheringstatechange += (state) =>
                 {
-                    _logger.LogInformation("[PC] ICE gathering state: {State}", state);
+                    LogInfo("[PC] ICE gathering state: {State}", state);
                     if (state == RTCIceGatheringState.complete)
                     {
                         iceGatheringComplete.TrySetResult(true);
@@ -217,16 +278,16 @@ namespace backend.Controllers
                     iceGatheringComplete.TrySetResult(true);
                 }
 
-                var completedTask = await Task.WhenAny(iceGatheringComplete.Task, Task.Delay(60000));
+                var completedTask = await Task.WhenAny(iceGatheringComplete.Task, Task.Delay(120000));
                 if (completedTask != iceGatheringComplete.Task)
                 {
-                    _logger.LogWarning("[PC] ICE gathering did not complete within 5s, returning SDP anyway.");
+                    LogWarn("[PC] ICE gathering did not complete within 120s, returning SDP anyway.");
                 }
 
                 // 5. Connection lifecycle management
                 pc.onconnectionstatechange += (state) =>
                 {
-                    _logger.LogInformation("[PC] Connection state: {State}", state);
+                    LogInfo("[PC] Connection state: {State}", state);
 
                     if (state == RTCPeerConnectionState.closed || state == RTCPeerConnectionState.failed)
                     {
@@ -242,11 +303,11 @@ namespace backend.Controllers
                             {
                                 if (!videoFormatSet)
                                 {
-                                    _logger.LogWarning("[FFmpeg] Connection state is 'connected' but video format " +
+                                    LogWarn("[FFmpeg] Connection state is 'connected' but video format " +
                                         "hasn't finished being set yet — waited for lock, proceeding now.");
                                 }
 
-                                _logger.LogInformation("[FFmpeg] Starting video source...");
+                                LogInfo("[FFmpeg] Starting video source...");
 
                                 var startTask = ffmpegSource.Start();
                                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(20));
@@ -255,7 +316,7 @@ namespace backend.Controllers
 
                                 if (raceResult == timeoutTask)
                                 {
-                                    _logger.LogError("[ffmpeg] RTSP connection timed out after 5s. Closing connection.");
+                                    LogErr("[ffmpeg] RTSP connection timed out after 120s. Closing connection.");
                                     await ffmpegSource.CloseVideo();
                                     pc.Close("RTSP source unreachable (timeout)");
                                 }
@@ -263,14 +324,14 @@ namespace backend.Controllers
                                 {
                                     // startTask finished first — but check if it actually succeeded or threw
                                     await startTask;
-                                    _logger.LogInformation("[ffmpeg] Start() completed successfully.");
+                                    LogInfo("[ffmpeg] Start() completed successfully.");
                                 }
 
-                                _logger.LogInformation("[FFmpeg] Start() returned normally.");
+                                LogInfo("[FFmpeg] Start() returned normally.");
                             }
                             catch (Exception ex)
                             {
-                                _logger.LogError(ex, "[FFmpeg] Start() threw an exception.");
+                                LogErrEx(ex, "[FFmpeg] Start() threw an exception.");
                             }
                             finally
                             {
@@ -282,28 +343,37 @@ namespace backend.Controllers
 
                 pc.oniceconnectionstatechange += (state) =>
                 {
-                    _logger.LogInformation("[PC] ICE connection state: {State}", state);
+                    LogInfo("[PC] ICE connection state: {State}", state);
                 };
+                var gatheredCandidates = new List<string>();
                 pc.onicecandidate += (candidate) =>
                 {
-                    _logger.LogInformation("[PC] Local ICE candidate: {Candidate}", candidate.candidate);
+                    LogInfo("[PC] Local ICE candidate: {Candidate}", candidate.candidate);
+                    if (!string.IsNullOrEmpty(candidate.candidate))
+                    {
+                        gatheredCandidates.Add(candidate.candidate);
+                    }
                 };
 
                 var finalSdp = pc.localDescription.sdp.ToString();
 
-                // WORKAROUND: SIPSorcery's SDP renderer only attaches gathered ICE candidates
-                // to one m-line (observed: only the inactive audio section got them, and only
-                // a subset). With BUNDLE, all m-lines should carry the same candidate set for
-                // non-trickle ICE - manually propagate every "a=candidate:" line found
-                // anywhere in the SDP into every m= section that's missing them.
-                var candidateLines = finalSdp
-                    .Split('\n')
-                    .Where(line => line.TrimStart().StartsWith("a=candidate:"))
-                    .Select(line => line.TrimEnd('\r'))
+                // WORKAROUND: SIPSorcery's SDP renderer only ever embeds a subset of the
+                // gathered ICE candidates into pc.localDescription.sdp (observed: only the
+                // host candidate, even though srflx/relay candidates were gathered and fired
+                // through onicecandidate above) - and even that subset only lands on one
+                // m-line. Scanning the SDP text for "a=candidate:" lines therefore only ever
+                // recovers the host candidate and silently drops the TURN relay candidate,
+                // which is the one that actually matters for any client not on the same LAN.
+                // Build the candidate lines from what onicecandidate actually observed instead
+                // of trusting the SDP SIPSorcery rendered, then stamp that full set into every
+                // m= section (replacing whatever partial set SIPSorcery put there) so all
+                // m-lines carry the same complete candidate set for non-trickle ICE.
+                var candidateLines = gatheredCandidates
                     .Distinct()
+                    .Select(c => $"a=candidate:{c}")
                     .ToList();
 
-                _logger.LogInformation("[PC] Found {Count} unique candidate lines to propagate: {Lines}",
+                LogInfo("[PC] Found {Count} unique candidate lines to propagate: {Lines}",
                     candidateLines.Count, string.Join(" | ", candidateLines));
 
                 if (candidateLines.Count > 0)
@@ -312,14 +382,14 @@ namespace backend.Controllers
                     var sections = normalizedSdp.Split(new[] { "\nm=" }, StringSplitOptions.None);
                     for (int i = 1; i < sections.Length; i++) // skip session-level header at index 0
                     {
-                        if (!sections[i].Contains("a=candidate:"))
-                        {
-                            var lines = sections[i].Split('\n').ToList();
-                            int insertAt = lines.FindIndex(l => l.TrimStart().StartsWith("a=ice-pwd:"));
-                            if (insertAt == -1) insertAt = lines.Count - 1;
-                            lines.InsertRange(insertAt + 1, candidateLines);
-                            sections[i] = string.Join("\n", lines);
-                        }
+                        var lines = sections[i]
+                            .Split('\n')
+                            .Where(l => !l.TrimStart().StartsWith("a=candidate:"))
+                            .ToList();
+                        int insertAt = lines.FindIndex(l => l.TrimStart().StartsWith("a=ice-pwd:"));
+                        if (insertAt == -1) insertAt = lines.Count - 1;
+                        lines.InsertRange(insertAt + 1, candidateLines);
+                        sections[i] = string.Join("\n", lines);
                     }
                     // NOTE: string.Join only inserts its separator *between*
                     // elements, never before the first one - `sections[0] +
@@ -334,8 +404,8 @@ namespace backend.Controllers
                 }
 
                 var candidateCount = finalSdp.Split(new[] { "a=candidate:" }, StringSplitOptions.None).Length - 1;
-                _logger.LogInformation("[PC] Returning answer with {Count} total candidate lines (after propagation fix). iceGatheringState={State}", candidateCount, pc.iceGatheringState);
-                _logger.LogInformation("[PC] Answer SDP (final):\n{Sdp}", finalSdp);
+                LogInfo("[PC] Returning answer with {Count} total candidate lines (after propagation fix). iceGatheringState={State}", candidateCount, pc.iceGatheringState);
+                LogInfo("[PC] Answer SDP (final):\n{Sdp}", finalSdp);
 
                 // WHEP requires a 201 Created response with SDP answer in the body
                 Response.StatusCode = StatusCodes.Status201Created;
@@ -344,7 +414,7 @@ namespace backend.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[PC] Exception during WHEP negotiation.");
+                LogErrEx(ex, "[PC] Exception during WHEP negotiation.");
 
                 await ffmpegSource.CloseVideo();
                 pc.Close("Negotiation failed");

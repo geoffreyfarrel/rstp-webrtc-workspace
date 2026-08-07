@@ -4,12 +4,18 @@ import { defineStore } from 'pinia';
 export const useConnectionStore = defineStore('connection', {
   state() {
     return {
-      connectionStatus: ConnectionStatusEnum.CONNECTING,
+      statuses: {} as Record<string, ConnectionStatusEnum>,
     };
   },
+  getters: {
+    getConnection:
+      (state) =>
+      (cameraId: string): ConnectionStatusEnum =>
+        state.statuses[cameraId] ?? ConnectionStatusEnum.CONNECTING,
+  },
   actions: {
-    setConnection(newStatus: ConnectionStatusEnum) {
-      this.connectionStatus = newStatus;
+    setConnection(cameraId: string, newStatus: ConnectionStatusEnum) {
+      this.statuses[cameraId] = newStatus;
     },
   },
 });

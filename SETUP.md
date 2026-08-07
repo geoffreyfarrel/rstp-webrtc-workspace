@@ -9,12 +9,13 @@ over WebRTC, via a C# WHEP backend and a TURN relay.
 Camera (RTSP) → backend/ (.NET + SIPSorcery, WHEP) → TURN relay → frontend/ (Vue, browser)
 ```
 
-- **`backend/`** — ASP.NET Core app. Pulls H264 from the camera over RTSP
-  (via `SIPSorceryMedia.FFmpeg`) and serves it as a
+- **`backend/`** — ASP.NET Core app. Pulls H264 from one or more cameras over
+  RTSP (via `SIPSorceryMedia.FFmpeg`) and serves each as a
   [WHEP](https://datatracker.ietf.org/doc/draft-ietf-wish-whep/) endpoint
-  (`POST /Stream/whep`) using SIPSorcery for the WebRTC/ICE side.
-- **`frontend/`** — Vue 3 + Vite app. Plays the stream with
-  `@eyevinn/webrtc-player` (a WHEP client).
+  (`POST /Stream/whep/{cameraId}`, cameras listed at `GET /Stream/cameras`)
+  using SIPSorcery for the WebRTC/ICE side.
+- **`frontend/`** — Vue 3 + Vite app. Fetches the camera list and plays one
+  stream per camera with `@eyevinn/webrtc-player` (a WHEP client).
 - **TURN server (coturn)** — relays media between the backend and the
   browser when a direct path isn't available. This project connects to an
   already-running coturn instance; it isn't part of this repo's setup.
@@ -38,20 +39,38 @@ Edit `backend/appsettings.json`:
 {
   "Turn": {
     "Host": "<turn-host>:3478",
-    "Username": "<turn-username>",
-    "Credential": "<turn-credential>"
+    "Secret": "<turn-static-auth-secret>"
   },
   "StreamSettings": {
     "FFmpegLibPath": "public/bin",
-    "RtspUrl": "rtsp://<user>:<password>@<camera-ip>/<path>",
-    "TargetBitrate": 100000
+    "TargetBitrate": 100000,
+    "Cameras": [
+      { "Id": "camera1", "Name": "Camera 1", "RtspUrl": "rtsp://<user>:<password>@<camera-ip>/<path>" }
+    ]
   }
 }
 ```
 
-- `Turn` must point at your TURN server.
-- `StreamSettings:RtspUrl` is your camera's RTSP URL, credentials included.
-- `TargetBitrate` caps the H264 encoder's output (bits per second).
+- `Turn:Host` must point at your TURN server. `Turn:Secret` is coturn's
+  `static-auth-secret` (requires coturn configured with `lt-cred-mech` +
+  `use-auth-secret`, not a static `user=` entry) - the backend mints a
+  fresh, time-limited username/credential per camera per connection from
+  this secret (`TurnCredentialGenerator`, coturn's TURN REST API scheme)
+  instead of every camera and every browser session sharing one static
+  TURN identity. That per-identity sharing was the actual cause of a
+  two-camera ICE failure bug: N cameras meant 2N concurrent TURN
+  allocations (backend + browser side, per camera) all under the same
+  username, and adding a camera would flap an existing one's connection.
+  The browser gets its own credential via `GET
+  /Stream/turn-credentials/{cameraId}` - the secret itself never reaches
+  client code.
+- `StreamSettings:Cameras` is an array — add one entry per camera. `Id` is
+  used in the URL (`/Stream/whep/{Id}`) so keep it URL-safe; `Name` is just
+  for display. `RtspUrl` is that camera's RTSP URL, credentials included -
+  it's never sent to the browser, only `Id`/`Name` are (via `GET
+  /Stream/cameras`).
+- `TargetBitrate` caps the H264 encoder's output (bits per second), applied
+  to every camera.
 
 Then run it:
 
@@ -76,13 +95,12 @@ npm install
 cp .env.example .env
 ```
 
-Edit `frontend/.env` — the TURN values must match what you put in
-`backend/appsettings.json`:
+Edit `frontend/.env` — the host must match what you put in
+`backend/appsettings.json` (no username/credential needed here; the
+backend mints those per-camera, see above):
 
 ```bash
 VITE_TURN_HOST=<turn-host>:3478
-VITE_TURN_USERNAME=<turn-username>
-VITE_TURN_CREDENTIAL=<turn-credential>
 ```
 
 Leave `VITE_BACKEND_URL` commented out to use the dev-server proxy (see
@@ -100,17 +118,20 @@ By default it's served at `http://localhost:5173`.
 
 ## 3. Watch it work
 
-Open `http://localhost:5173` in a browser. Video should start playing within
-a few seconds.
+Open `http://localhost:5173` in a browser. One video tile per camera in
+`StreamSettings:Cameras` should appear and start playing within a few
+seconds.
 
-What a working connection looks like in the backend console:
+What a working connection looks like in the backend console (each line is
+prefixed with the camera's `Id` so multiple cameras' logs stay
+distinguishable):
 
 ```
-[PC] ICE gathering state: complete
-[PC] Connection state: connected
-[FFmpeg] Starting video source...
-[ffmpeg] Start() completed successfully.
-[FFmpeg] Sending sample, ... bytes
+[camera1] [PC] ICE gathering state: complete
+[camera1] [PC] Connection state: connected
+[camera1] [FFmpeg] Starting video source...
+[camera1] [ffmpeg] Start() completed successfully.
+[camera1] [FFmpeg] Sending sample, ... bytes
 ```
 
 And in the browser console: no errors from `@eyevinn/webrtc-player`, and the
