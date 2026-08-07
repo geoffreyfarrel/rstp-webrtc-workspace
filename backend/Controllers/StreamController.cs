@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using System.Reflection;
+using Microsoft.AspNetCore.Mvc;
 using SIPSorcery.Net;
 using SIPSorceryMedia.Abstractions;
 using SIPSorceryMedia.FFmpeg;
@@ -41,13 +42,30 @@ namespace backend.Controllers
                 return BadRequest("No SDP offer provided.");
             }
 
-            // 2. Initialize a new WebRTC Peer Connection (with a STUN server configured)
+            // NOTE: don't try to strip the offer's audio m-line to sidestep
+            // SIPSorcery's handling of it - tried that, and it breaks a
+            // different rule instead: the answer must have the same number
+            // and order of m-lines as the offer the browser itself sent
+            // (RFC 3264/JSEP), so Chrome rejected the answer with "The order
+            // of m-lines in answer doesn't match order in offer." An
+            // unwanted m-line must be answered as inactive/rejected, not
+            // omitted.
+            _logger.LogInformation("[PC] Offer SDP (raw):\n{Sdp}", offerSdp);
+
+            // 2. Initialize a new WebRTC Peer Connection (STUN fallback + our TURN relay)
             var config = new RTCConfiguration
             {
                 iceServers = new List<RTCIceServer>
                 {
-                    new RTCIceServer { urls = "stun:stun.l.google.com:19302" }
-                }
+                    // new RTCIceServer { urls = "stun:stun.l.google.com:19302" },
+                    new RTCIceServer
+                    {
+                        urls = $"turn:{_configuration["Turn:Host"]}",
+                        username = _configuration["Turn:Username"],
+                        credential = _configuration["Turn:Credential"],
+                    },
+                },
+                X_BindAddress = System.Net.IPAddress.Any,
             };
             var pc = new RTCPeerConnection(config);
 
@@ -82,6 +100,14 @@ namespace backend.Controllers
                 var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.SendOnly);
                 pc.addTrack(videoTrack);
 
+                // Bandwidth for the TURN-relay test is minimized via the encoder bitrate cap
+                // alone (see SetVideoEncoderBitrate below). An earlier attempt to also drop
+                // most encoded samples here broke H264's inter-frame prediction chain - only
+                // the very first sample is a true self-contained IDR, so skipping frames after
+                // it (P-frames, or "keyframes" libx264 silently downgrades to non-IDR I-frames)
+                // left the decoder permanently out of sync and nothing ever rendered. Every
+                // encoded sample must be forwarded.
+
                 // Wire up the encoded video samples from FFmpeg to the WebRTC connection
                 ffmpegSource.OnVideoSourceEncodedSample += (durationRtpUnits, sample) =>
                 {
@@ -115,6 +141,26 @@ namespace backend.Controllers
                             ffmpegSource.SetVideoSourceFormat(chosenFormat);
                             videoFormatSet = true;
                             _logger.LogInformation("[FFmpeg] SetVideoSourceFormat completed OK");
+
+                            // SIPSorceryMedia.FFmpeg doesn't expose bitrate control on
+                            // FFmpegFileSource itself, only on the internal FFmpegVideoSource
+                            // it wraps (private field). Reached via reflection to cap the H264
+                            // encoder's target bitrate for the TURN bandwidth test. NOTE: relies
+                            // on the "_FFmpegVideoSource" private field name in the
+                            // SIPSorceryMedia.FFmpeg NuGet package (v10.0.12) — re-check this if
+                            // that package is upgraded.
+                            var targetBitrate = _configuration.GetValue<long?>("StreamSettings:TargetBitrate") ?? 100_000;
+                            var videoSourceField = typeof(FFmpegFileSource).GetField(
+                                "_FFmpegVideoSource", BindingFlags.NonPublic | BindingFlags.Instance);
+                            if (videoSourceField?.GetValue(ffmpegSource) is FFmpegVideoSource innerVideoSource)
+                            {
+                                innerVideoSource.SetVideoEncoderBitrate(targetBitrate, null, null, targetBitrate);
+                                _logger.LogInformation("[FFmpeg] Capped encoder bitrate to {Bitrate} bps", targetBitrate);
+                            }
+                            else
+                            {
+                                _logger.LogWarning("[FFmpeg] Could not reach internal FFmpegVideoSource via reflection; bitrate not capped.");
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -154,7 +200,7 @@ namespace backend.Controllers
                     iceGatheringComplete.TrySetResult(true);
                 }
 
-                var completedTask = await Task.WhenAny(iceGatheringComplete.Task, Task.Delay(5000));
+                var completedTask = await Task.WhenAny(iceGatheringComplete.Task, Task.Delay(60000));
                 if (completedTask != iceGatheringComplete.Task)
                 {
                     _logger.LogWarning("[PC] ICE gathering did not complete within 5s, returning SDP anyway.");
@@ -186,7 +232,7 @@ namespace backend.Controllers
                                 _logger.LogInformation("[FFmpeg] Starting video source...");
 
                                 var startTask = ffmpegSource.Start();
-                                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+                                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(20));
 
                                 var raceResult = await Task.WhenAny(startTask, timeoutTask);
 
@@ -221,11 +267,63 @@ namespace backend.Controllers
                 {
                     _logger.LogInformation("[PC] ICE connection state: {State}", state);
                 };
+                pc.onicecandidate += (candidate) =>
+                {
+                    _logger.LogInformation("[PC] Local ICE candidate: {Candidate}", candidate.candidate);
+                };
+
+                var finalSdp = pc.localDescription.sdp.ToString();
+
+                // WORKAROUND: SIPSorcery's SDP renderer only attaches gathered ICE candidates
+                // to one m-line (observed: only the inactive audio section got them, and only
+                // a subset). With BUNDLE, all m-lines should carry the same candidate set for
+                // non-trickle ICE - manually propagate every "a=candidate:" line found
+                // anywhere in the SDP into every m= section that's missing them.
+                var candidateLines = finalSdp
+                    .Split('\n')
+                    .Where(line => line.TrimStart().StartsWith("a=candidate:"))
+                    .Select(line => line.TrimEnd('\r'))
+                    .Distinct()
+                    .ToList();
+
+                _logger.LogInformation("[PC] Found {Count} unique candidate lines to propagate: {Lines}",
+                    candidateLines.Count, string.Join(" | ", candidateLines));
+
+                if (candidateLines.Count > 0)
+                {
+                    var normalizedSdp = finalSdp.Replace("\r\n", "\n");
+                    var sections = normalizedSdp.Split(new[] { "\nm=" }, StringSplitOptions.None);
+                    for (int i = 1; i < sections.Length; i++) // skip session-level header at index 0
+                    {
+                        if (!sections[i].Contains("a=candidate:"))
+                        {
+                            var lines = sections[i].Split('\n').ToList();
+                            int insertAt = lines.FindIndex(l => l.TrimStart().StartsWith("a=ice-pwd:"));
+                            if (insertAt == -1) insertAt = lines.Count - 1;
+                            lines.InsertRange(insertAt + 1, candidateLines);
+                            sections[i] = string.Join("\n", lines);
+                        }
+                    }
+                    // NOTE: string.Join only inserts its separator *between*
+                    // elements, never before the first one - `sections[0] +
+                    // string.Join("\nm=", sections.Skip(1))` was
+                    // concatenating the header directly onto the first m=
+                    // section with no newline (e.g. "...BUNDLE 0video 9
+                    // ..."), corrupting the SDP on every response that had
+                    // any candidates to propagate. The leading "\nm=" below
+                    // fixes that.
+                    finalSdp = sections[0] + "\nm=" + string.Join("\nm=", sections.Skip(1));
+                    finalSdp = finalSdp.Replace("\n", "\r\n");
+                }
+
+                var candidateCount = finalSdp.Split(new[] { "a=candidate:" }, StringSplitOptions.None).Length - 1;
+                _logger.LogInformation("[PC] Returning answer with {Count} total candidate lines (after propagation fix). iceGatheringState={State}", candidateCount, pc.iceGatheringState);
+                _logger.LogInformation("[PC] Answer SDP (final):\n{Sdp}", finalSdp);
 
                 // WHEP requires a 201 Created response with SDP answer in the body
                 Response.StatusCode = StatusCodes.Status201Created;
 
-                return Content(pc.localDescription.sdp.ToString(), "application/sdp");
+                return Content(finalSdp, "application/sdp");
             }
             catch (Exception ex)
             {
