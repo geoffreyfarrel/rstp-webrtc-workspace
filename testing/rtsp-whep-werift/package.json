@@ -1,0 +1,15 @@
+{
+  "name": "rtsp-whep-werift",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Minimal WHEP server (werift, no SIPSorcery) serving the real RTSP camera through the proven TURN relay - swap this in for the C# backend via VITE_BACKEND_URL to isolate whether the app bug is SIPSorcery-specific.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "werift": "^0.24.3"
+  }
+}

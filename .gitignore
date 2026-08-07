@@ -29,9 +29,13 @@ Thumbs.db
 [Oo]bj/
 # Ignore development environment secrets and local database files
 appsettings.Development.json
+appsettings.json
+!appsettings.example.json
 *.sqlite
 *.sqlite3
 *.db
+*.pid
+*.log
 
 # =========================
 # Vue / Node.js (Frontend)

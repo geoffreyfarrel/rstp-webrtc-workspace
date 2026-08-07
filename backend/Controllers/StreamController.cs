@@ -139,6 +139,42 @@ namespace backend.Controllers
             // Restrict to a specific format the encoder can actually produce
             ffmpegSource.RestrictFormats(format => format.Codec == VideoCodecsEnum.H264);
 
+            // Optional per-camera override of libavformat's RTSP transport
+            // negotiation. FFmpegFileSource itself exposes no way to pass
+            // this through, so reach into the internal FFmpegVideoSource
+            // (same reflection pattern as the bitrate cap below) and call
+            // its public InitialiseDecoder(options), which forwards the
+            // dictionary straight to avformat_open_input as an AVDictionary
+            // (e.g. rtsp_transport=tcp). NOTE: relies on the
+            // "_FFmpegVideoSource" private field name in the
+            // SIPSorceryMedia.FFmpeg NuGet package (v10.0.12) — re-check
+            // this if that package is upgraded.
+            //
+            // Must happen here, before ffmpegSource.Start() below calls
+            // StartDecode() - the decoder only actually opens the stream
+            // once (guarded by an internal _isInitialised flag), so
+            // whichever options are set first are the ones that stick;
+            // StartDecode()'s own no-arg InitialiseSource() call is then a
+            // no-op that keeps them.
+            if (!string.IsNullOrEmpty(camera.RtspTransport))
+            {
+                var videoSourceField = typeof(FFmpegFileSource).GetField(
+                    "_FFmpegVideoSource", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (videoSourceField?.GetValue(ffmpegSource) is FFmpegVideoSource rtspVideoSource)
+                {
+                    rtspVideoSource.InitialiseDecoder(new Dictionary<string, string>
+                    {
+                        ["rtsp_transport"] = camera.RtspTransport,
+                    });
+                    LogInfo("[FFmpeg] Forcing RTSP transport '{Transport}' for '{CameraName}'",
+                        camera.RtspTransport, camera.Name);
+                }
+                else
+                {
+                    LogWarn("[FFmpeg] Could not reach internal FFmpegVideoSource via reflection; RtspTransport override ignored.");
+                }
+            }
+
             // not necessary
             var ffmpegInitLock = new SemaphoreSlim(1, 1);
             var videoFormatSet = false;

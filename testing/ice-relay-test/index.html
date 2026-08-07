@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ICE relay-to-relay isolation test</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #12141a; color: #e8e8e8; margin: 0; padding: 1.5rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 0.25rem; }
+  p.sub { color: #9aa0ab; margin: 0 0 1.25rem; font-size: 0.9rem; }
+  fieldset { border: 1px solid #333844; border-radius: 8px; margin-bottom: 1rem; }
+  legend { padding: 0 0.5rem; color: #9aa0ab; font-size: 0.85rem; }
+  label { display: block; font-size: 0.8rem; color: #9aa0ab; margin-top: 0.5rem; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4rem; margin-top: 0.15rem; background: #1c1f28; border: 1px solid #333844; border-radius: 4px; color: #e8e8e8; }
+  button { margin-top: 0.75rem; padding: 0.5rem 1.25rem; border: none; border-radius: 6px; background: #3b82f6; color: white; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #333844; cursor: not-allowed; }
+  #banner { padding: 0.75rem 1rem; border-radius: 8px; font-weight: 700; margin-bottom: 1rem; background: #333844; }
+  #banner.pass { background: #14532d; color: #86efac; }
+  #banner.fail { background: #4c1d24; color: #fca5a5; }
+  .videos { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .videos div { flex: 1; min-width: 260px; }
+  video { width: 100%; background: #000; border-radius: 8px; }
+  .meta { font-size: 0.8rem; color: #9aa0ab; margin-top: 0.25rem; }
+  #log { background: #0b0d12; border: 1px solid #333844; border-radius: 8px; padding: 0.75rem; height: 220px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.78rem; white-space: pre-wrap; }
+  .row { display: flex; gap: 1rem; }
+  .row > div { flex: 1; }
+</style>
+</head>
+<body>
+  <h1>ICE relay-to-relay isolation test</h1>
+  <p class="sub">
+    No SIPSorcery, no FFmpeg, no WHEP, no player library - just two raw
+    RTCPeerConnections forced to use <code>iceTransportPolicy: 'relay'</code>
+    against your TURN server. Open this same page in a second tab (ideally on
+    a different network) and click Start in both.
+  </p>
+
+  <div id="banner">Not started.</div>
+
+  <fieldset>
+    <legend>TURN server (from frontend/.env)</legend>
+    <div class="row">
+      <div>
+        <label for="turnHost">Host:port</label>
+        <input id="turnHost" placeholder="<turn-host>:3478" />
+      </div>
+      <div>
+        <label for="turnUsername">Username</label>
+        <input id="turnUsername" placeholder="<turn-username>" />
+      </div>
+      <div>
+        <label for="turnCredential">Credential</label>
+        <input id="turnCredential" type="password" placeholder="<turn-credential>" />
+      </div>
+    </div>
+    <button id="startBtn">Start</button>
+    <span class="meta">Role: <strong id="role">connecting...</strong> | Data channel RTT: <strong id="rtt">-</strong></span>
+  </fieldset>
+
+  <div class="videos">
+    <div>
+      <video id="localVideo" autoplay playsinline muted></video>
+      <div class="meta">Local synthetic test pattern (canvas.captureStream)</div>
+    </div>
+    <div>
+      <video id="remoteVideo" autoplay playsinline muted></video>
+      <div class="meta">Remote track received from peer</div>
+    </div>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('log');
+  const bannerEl = $('banner');
+  const localVideo = $('localVideo');
+  const remoteVideo = $('remoteVideo');
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent += `[${t}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(kind, msg) {
+    bannerEl.className = kind === 'PASS' ? 'pass' : kind === 'FAIL' ? 'fail' : '';
+    bannerEl.textContent = (kind === 'PASS' ? 'PASS - ' : kind === 'FAIL' ? 'FAIL - ' : '') + msg;
+  }
+
+  // --- persisted TURN config ---
+  for (const key of ['turnHost', 'turnUsername', 'turnCredential']) {
+    const saved = localStorage.getItem(key);
+    if (saved) $(key).value = saved;
+  }
+
+  // --- signaling ---
+  let ws, role, peerJoined = false, started = false;
+  let pendingOffer = null;
+  const pendingCandidates = [];
+
+  function send(obj) {
+    ws.send(JSON.stringify(obj));
+  }
+
+  function connectWS() {
+    // Use wss:// when the page itself is loaded over https (e.g. via an
+    // ngrok tunnel, which terminates TLS) - browsers block a plain ws://
+    // connection from an https:// page as mixed content.
+    const wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(`${wsScheme}${location.host}`);
+    ws.onopen = () => log('Signaling connected.');
+    ws.onclose = () => log('Signaling disconnected.');
+    ws.onerror = () => log('Signaling error.');
+    ws.onmessage = (ev) => handleSignal(JSON.parse(ev.data));
+  }
+
+  function handleSignal(msg) {
+    switch (msg.type) {
+      case 'ready':
+        role = msg.role;
+        $('role').textContent = role;
+        log(`Assigned role: ${role}`);
+        break;
+      case 'peer-joined':
+        peerJoined = true;
+        log('Peer joined the room.');
+        if (started && role === 'offerer') createOffer();
+        break;
+      case 'peer-left':
+        log('Peer left.');
+        setStatus('FAIL', 'Peer disconnected.');
+        break;
+      case 'offer':
+        if (!pc) {
+          pendingOffer = msg.sdp;
+          log('Offer received, waiting for Start...');
+        } else {
+          handleOffer(msg.sdp);
+        }
+        break;
+      case 'answer':
+        pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
+          .then(() => log('Remote answer set.'))
+          .catch((e) => log('setRemoteDescription (answer) error: ' + e));
+        break;
+      case 'candidate':
+        if (!pc) {
+          pendingCandidates.push(msg.candidate);
+        } else {
+          pc.addIceCandidate(msg.candidate).catch((e) => log('addIceCandidate error: ' + e));
+        }
+        break;
+      case 'error':
+        log('Server: ' + msg.message);
+        break;
+    }
+  }
+
+  // --- synthetic local video (no camera needed) ---
+  function makeCanvasStream() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 320;
+    canvas.height = 240;
+    const ctx = canvas.getContext('2d');
+    let frame = 0;
+    setInterval(() => {
+      frame++;
+      ctx.fillStyle = '#00220a';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#22ff88';
+      ctx.font = '16px monospace';
+      ctx.fillText(`${role || '?'} frame ${frame}`, 10, 30);
+      ctx.fillText(new Date().toLocaleTimeString(), 10, 55);
+      ctx.beginPath();
+      ctx.arc(160 + 110 * Math.sin(frame / 10), 150, 14, 0, 2 * Math.PI);
+      ctx.fill();
+    }, 100);
+    return canvas.captureStream(10);
+  }
+
+  // --- data channel probe (independent connectivity signal + RTT) ---
+  let dc;
+  function setupDataChannel(channel) {
+    dc = channel;
+    dc.onopen = () => {
+      log('Data channel open.');
+      setInterval(() => {
+        if (dc.readyState === 'open') dc.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+      }, 2000);
+    };
+    dc.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'ping') {
+        dc.send(JSON.stringify({ type: 'pong', t: msg.t }));
+      } else if (msg.type === 'pong') {
+        $('rtt').textContent = (performance.now() - msg.t).toFixed(1) + ' ms';
+      }
+    };
+    dc.onclose = () => log('Data channel closed.');
+  }
+
+  // --- peer connection ---
+  let pc;
+  let statsPollInterval;
+
+  // Strip an accidentally-pasted "turn:"/"turns:" scheme so we don't end up
+  // constructing "turn:turn:host:port", which Chrome rejects.
+  function normalizeTurnHost(raw) {
+    return raw.trim().replace(/^turns?:/i, '');
+  }
+
+  function createPeerConnection() {
+    const turnUrl = `turn:${normalizeTurnHost($('turnHost').value)}`;
+    const iceServers = [
+      {
+        urls: turnUrl,
+        username: $('turnUsername').value,
+        credential: $('turnCredential').value,
+      },
+    ];
+    log(`Using ICE server URL: ${turnUrl}`);
+    try {
+      pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: 'relay' });
+    } catch (e) {
+      log(`RTCPeerConnection construction failed: ${e.message}`);
+      setStatus('FAIL', `Bad TURN URL "${turnUrl}": ${e.message}. Check the Host:port field - it should be just "host:port" (e.g. turn.example.com:3478), no scheme, no credentials, no query string unless you mean to add one like ?transport=udp.`);
+      started = false;
+      $('startBtn').disabled = false;
+      throw e;
+    }
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) send({ type: 'candidate', candidate: e.candidate.toJSON() });
+    };
+    pc.oniceconnectionstatechange = () => log('ICE connection state: ' + pc.iceConnectionState);
+    pc.onconnectionstatechange = () => {
+      log('Connection state: ' + pc.connectionState);
+      if (pc.connectionState === 'connected') {
+        onConnected();
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        clearInterval(statsPollInterval);
+        setStatus('FAIL', `Connection state: ${pc.connectionState}`);
+      }
+    };
+    pc.ontrack = (e) => {
+      remoteVideo.srcObject = e.streams[0];
+      log('Remote track received: ' + e.track.kind);
+    };
+    pc.ondatachannel = (e) => setupDataChannel(e.channel);
+
+    const stream = makeCanvasStream();
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    localVideo.srcObject = stream;
+
+    if (role === 'offerer') {
+      setupDataChannel(pc.createDataChannel('probe'));
+    }
+
+    while (pendingCandidates.length) {
+      pc.addIceCandidate(pendingCandidates.shift()).catch((e) => log('addIceCandidate error: ' + e));
+    }
+  }
+
+  async function createOffer() {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: 'offer', sdp: offer.sdp });
+    log('Offer sent.');
+  }
+
+  async function handleOffer(sdp) {
+    await pc.setRemoteDescription({ type: 'offer', sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send({ type: 'answer', sdp: answer.sdp });
+    log('Answer sent.');
+  }
+
+  async function onConnected() {
+    const stats = await pc.getStats();
+    let pairStats, localCand, remoteCand;
+    stats.forEach((r) => {
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated !== false) {
+        pairStats = r;
+      }
+    });
+    if (pairStats) {
+      stats.forEach((r) => {
+        if (r.id === pairStats.localCandidateId) localCand = r;
+        if (r.id === pairStats.remoteCandidateId) remoteCand = r;
+      });
+    }
+    const localType = localCand && localCand.candidateType;
+    const remoteType = remoteCand && remoteCand.candidateType;
+    log(`Candidate pair: local=${localType} (${localCand ? localCand.address + ':' + localCand.port : '?'}) <-> remote=${remoteType} (${remoteCand ? remoteCand.address + ':' + remoteCand.port : '?'})`);
+
+    if (localType !== 'relay' || remoteType !== 'relay') {
+      setStatus('FAIL', `Connected, but candidate types were "${localType}"/"${remoteType}", not relay/relay.`);
+      return;
+    }
+
+    waitForMediaFlow();
+  }
+
+  function waitForMediaFlow() {
+    let lastBytes = 0;
+    let risingCount = 0;
+    statsPollInterval = setInterval(async () => {
+      const stats = await pc.getStats();
+      let bytes = 0;
+      stats.forEach((r) => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video') bytes = r.bytesReceived;
+      });
+      if (bytes > lastBytes) {
+        risingCount++;
+        lastBytes = bytes;
+        if (risingCount >= 2) {
+          clearInterval(statsPollInterval);
+          setStatus('PASS', `Relay-to-relay CONNECTED, video flowing (${bytes} bytes received). TURN infrastructure is working.`);
+        }
+      }
+    }, 1000);
+  }
+
+  // --- start ---
+  $('startBtn').addEventListener('click', () => {
+    if (started) return;
+    started = true;
+    $('startBtn').disabled = true;
+    ['turnHost', 'turnUsername', 'turnCredential'].forEach((key) => localStorage.setItem(key, $(key).value));
+
+    try {
+      createPeerConnection();
+    } catch (e) {
+      return; // already logged + banner set inside createPeerConnection
+    }
+    setStatus('', 'Connecting...');
+
+    if (pendingOffer) {
+      handleOffer(pendingOffer);
+      pendingOffer = null;
+    } else if (role === 'offerer') {
+      if (peerJoined) createOffer();
+      else log('Waiting for peer to join...');
+    }
+  });
+
+  connectWS();
+</script>
+</body>
+</html>

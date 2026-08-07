@@ -1,0 +1,13 @@
+{
+  "name": "ice-relay-test",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Standalone relay-to-relay ICE/TURN isolation test - no SIPSorcery, no FFmpeg, no WHEP, no player library.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
